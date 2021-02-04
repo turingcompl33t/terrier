@@ -840,8 +840,13 @@ void LLVMEngine::CompiledModuleBuilder::DefineFunction(const FunctionInfo &func_
         const llvm::DataLayout &dl = llvm_module_->getDataLayout();
         llvm::Type *pointee_type = args[1]->getType()->getPointerElementType();
         int64_t offset = llvm::cast<llvm::ConstantInt>(args[2])->getSExtValue();
+
         if (auto struct_type = llvm::dyn_cast<llvm::StructType>(pointee_type)) {
           const uint32_t elem_index = dl.getStructLayout(struct_type)->getElementContainingOffset(offset);
+          if (16 == offset) {
+            std::cout << "Struct type, 16 offset, elem index = " << elem_index << std::endl;
+          }
+
           llvm::Value *addr = ir_builder->CreateStructGEP(args[1], elem_index);
           ir_builder->CreateStore(addr, args[0]);
         } else {
@@ -1156,9 +1161,6 @@ void LLVMEngine::Shutdown() { llvm::llvm_shutdown(); }
 std::unique_ptr<LLVMEngine::CompiledModule> LLVMEngine::Compile(const BytecodeModule &module,
                                                                 const CompilerOptions &options) {
   CompiledModuleBuilder builder(options, module);
-
-  std::cerr << "BYTECODE MODULE:" << std::endl; 
-  module.Dump(std::cerr);
 
   builder.DeclareStaticLocals();
 
