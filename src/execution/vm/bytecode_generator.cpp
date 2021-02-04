@@ -3645,14 +3645,18 @@ void BytecodeGenerator::VisitMemberExpr(ast::MemberExpr *node) {
   // object is zero, we needn't do anything - we can just reinterpret the object
   // pointer. If the field offset is greater than zero, we generate a LEA.
 
-  LocalVar field_ptr;
-  if (offset == 0) {
-    field_ptr = obj_ptr;
-  } else {
-    field_ptr = GetCurrentFunction()->NewLocal(node->GetType()->PointerTo());
-    GetEmitter()->EmitLea(field_ptr, obj_ptr, offset);
-    field_ptr = field_ptr.ValueOf();
-  }
+  // LocalVar field_ptr;
+  // if (offset == 0) {
+  //   field_ptr = obj_ptr;
+  // } else {
+  //   field_ptr = GetCurrentFunction()->NewLocal(node->GetType()->PointerTo());
+  //   GetEmitter()->EmitLea(field_ptr, obj_ptr, offset);
+  //   field_ptr = field_ptr.ValueOf();
+  // }
+
+  auto field_ptr = GetCurrentFunction()->NewLocal(node->GetType()->PointerTo());
+  GetEmitter()->EmitLea(field_ptr, obj_ptr, offset);
+  field_ptr = field_ptr.ValueOf();
 
   if (GetExecutionResult()->IsLValue()) {
     NOISEPAGE_ASSERT(!GetExecutionResult()->HasDestination(), "L-Values produce their destination");
