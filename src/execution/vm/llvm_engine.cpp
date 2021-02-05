@@ -297,10 +297,16 @@ class LLVMEngine::FunctionLocalsMap {
   // return the corresponding LLVM value.
   llvm::Value *GetArgumentById(LocalVar var);
 
+  // Do stuff.
+  ast::Type* GetAstArgumentById(LocalVar var);
+
  private:
   llvm::IRBuilder<> *ir_builder_;
   llvm::DenseMap<uint32_t, llvm::Value *> params_;
   llvm::DenseMap<uint32_t, llvm::Value *> locals_;
+
+  llvm::DenseMap<uint32_t, ast::Type*> ast_params_;
+  llvm::DenseMap<uint32_t, ast::Type*> ast_locals_;
 };
 
 LLVMEngine::FunctionLocalsMap::FunctionLocalsMap(const FunctionInfo &func_info, llvm::Function *func, TypeMap *type_map,
@@ -315,6 +321,7 @@ LLVMEngine::FunctionLocalsMap::FunctionLocalsMap(const FunctionInfo &func_info, 
     llvm::Type *ret_type = type_map->GetLLVMType(func_type->GetReturnType());
     llvm::Value *val = ir_builder_->CreateAlloca(ret_type);
     params_[func_locals[0].GetOffset()] = val;
+    ast_params_[func_locals[0].GetOffset()] = func_type->GetReturnType();
     local_idx++;
   }
 
@@ -322,6 +329,7 @@ LLVMEngine::FunctionLocalsMap::FunctionLocalsMap(const FunctionInfo &func_info, 
   for (auto arg_iter = func->arg_begin(); local_idx < func_info.GetParamsCount(); ++local_idx, ++arg_iter) {
     const LocalInfo &param = func_locals[local_idx];
     params_[param.GetOffset()] = &*arg_iter;
+    ast_params_[param.GetOffset()] = param.GetType();
   }
 
   // Allocate all local variables up front.
@@ -330,6 +338,7 @@ LLVMEngine::FunctionLocalsMap::FunctionLocalsMap(const FunctionInfo &func_info, 
     llvm::Type *llvm_type = type_map->GetLLVMType(local_info.GetType());
     llvm::Value *val = ir_builder_->CreateAlloca(llvm_type);
     locals_[local_info.GetOffset()] = val;
+    ast_locals_[local_info.GetOffset()] = local_info.GetType();
   }
 }
 
@@ -352,6 +361,19 @@ llvm::Value *LLVMEngine::FunctionLocalsMap::GetArgumentById(LocalVar var) {
 
   return nullptr;
 }
+
+ast::Type *LLVMEngine::FunctionLocalsMap::GetAstArgumentById(LocalVar var) {
+  if (auto iter = ast_params_.find(var.GetOffset()); iter != ast_params_.end()) {
+    return iter->second;
+  }
+
+  if (auto iter = ast_locals_.find(var.GetOffset()); iter != ast_locals_.end()) {
+    return iter->second;
+  }
+
+  EXECUTION_LOG_ERROR("No type information found at offset {}", var.GetOffset());
+  return nullptr;
+} 
 
 // ---------------------------------------------------------
 // Compiled Module Builder
@@ -675,6 +697,8 @@ void LLVMEngine::CompiledModuleBuilder::DefineFunction(const FunctionInfo &func_
 
     // Collect arguments
     llvm::SmallVector<llvm::Value *, 8> args;
+    llvm::SmallVector<ast::Type*, 8> types{};
+
     for (uint32_t i = 0; i < Bytecodes::NumOperands(bytecode); i++) {
       switch (Bytecodes::GetNthOperandType(bytecode, i)) {
         case OperandType::None: {
@@ -682,43 +706,52 @@ void LLVMEngine::CompiledModuleBuilder::DefineFunction(const FunctionInfo &func_
         }
         case OperandType::Imm1: {
           args.push_back(llvm::ConstantInt::get(type_map_->Int8Type(), iter.GetImmediateIntegerOperand(i), true));
+          types.push_back(nullptr);
           break;
         }
         case OperandType::Imm2: {
           args.push_back(llvm::ConstantInt::get(type_map_->Int16Type(), iter.GetImmediateIntegerOperand(i), true));
+          types.push_back(nullptr);
           break;
         }
         case OperandType::Imm4: {
           args.push_back(llvm::ConstantInt::get(type_map_->Int32Type(), iter.GetImmediateIntegerOperand(i), true));
+          types.push_back(nullptr);
           break;
         }
         case OperandType::Imm8: {
           args.push_back(llvm::ConstantInt::get(type_map_->Int64Type(), iter.GetImmediateIntegerOperand(i), true));
+          types.push_back(nullptr);
           break;
         }
         case OperandType::Imm4F: {
           args.push_back(llvm::ConstantFP::get(type_map_->Float32Type(), iter.GetImmediateFloatOperand(i)));
+          types.push_back(nullptr);
           break;
         }
         case OperandType::Imm8F: {
           args.push_back(llvm::ConstantFP::get(type_map_->Float64Type(), iter.GetImmediateFloatOperand(i)));
+          types.push_back(nullptr);
           break;
         }
         case OperandType::UImm2: {
           args.push_back(
               llvm::ConstantInt::get(type_map_->UInt16Type(), iter.GetUnsignedImmediateIntegerOperand(i), false));
+          types.push_back(nullptr);
           break;
         }
         case OperandType::UImm4: {
           args.push_back(
               llvm::ConstantInt::get(type_map_->UInt32Type(), iter.GetUnsignedImmediateIntegerOperand(i), false));
+          types.push_back(nullptr);
           break;
         }
         case OperandType::FunctionId: {
           const FunctionInfo *target_func_info = tpl_module_.GetFuncInfoById(iter.GetFunctionIdOperand(i));
           llvm::Function *target_func = llvm_module_->getFunction(target_func_info->GetName());
           NOISEPAGE_ASSERT(target_func != nullptr, "Function doesn't exist in LLVM module");
-          args.push_back(target_func);
+          args.push_back(target_func);  
+          types.push_back(nullptr);
           break;
         }
         case OperandType::JumpOffset: {
@@ -728,6 +761,7 @@ void LLVMEngine::CompiledModuleBuilder::DefineFunction(const FunctionInfo &func_
         case OperandType::Local: {
           LocalVar local = iter.GetLocalOperand(i);
           args.push_back(locals_map.GetArgumentById(local));
+          types.push_back(locals_map.GetAstArgumentById(local));
           break;
         }
         case OperandType::StaticLocal: {
@@ -735,6 +769,7 @@ void LLVMEngine::CompiledModuleBuilder::DefineFunction(const FunctionInfo &func_
           const auto static_locals_iter = static_locals_.find(offset);
           NOISEPAGE_ASSERT(static_locals_iter != static_locals_.end(), "Static local at offset does not exist");
           args.push_back(static_locals_iter->second);
+          types.push_back(nullptr);
           break;
         }
         case OperandType::LocalCount: {
@@ -742,6 +777,7 @@ void LLVMEngine::CompiledModuleBuilder::DefineFunction(const FunctionInfo &func_
           iter.GetLocalCountOperand(i, &locals);
           for (const auto local : locals) {
             args.push_back(locals_map.GetArgumentById(local));
+            types.push_back(locals_map.GetAstArgumentById(local));
           }
           break;
         }
@@ -837,18 +873,66 @@ void LLVMEngine::CompiledModuleBuilder::DefineFunction(const FunctionInfo &func_
 
       case Bytecode::Lea: {
         NOISEPAGE_ASSERT(args[1]->getType()->isPointerTy(), "First argument must be a pointer");
+        // The first two arguments to Lea must be locals (is this true?)
+        NOISEPAGE_ASSERT(types[0] != nullptr, "nullptr for local 0");
+        NOISEPAGE_ASSERT(types[1] != nullptr, "nullptr for local 1");
+
+        std::cout << "Codegen Lea" << std::endl;
+        
         const llvm::DataLayout &dl = llvm_module_->getDataLayout();
         llvm::Type *pointee_type = args[1]->getType()->getPointerElementType();
         int64_t offset = llvm::cast<llvm::ConstantInt>(args[2])->getSExtValue();
 
         if (auto struct_type = llvm::dyn_cast<llvm::StructType>(pointee_type)) {
-          const uint32_t elem_index = dl.getStructLayout(struct_type)->getElementContainingOffset(offset);
-          if (16 == offset) {
-            std::cout << "Struct type, 16 offset, elem index = " << elem_index << std::endl;
+          NOISEPAGE_ASSERT(types[1]->IsPointerType() || types[1]->IsStructType(), "First argument must be pointer or struct type");
+          if (types[1]->IsPointerType()) {
+            NOISEPAGE_ASSERT(types[1]->As<ast::PointerType>()->GetPointeeType()->IsStructType(), "Pointer must be to struct type");
           }
 
-          llvm::Value *addr = ir_builder->CreateStructGEP(args[1], elem_index);
+          // Pull out the AST type for the outermost structure
+          ast::StructType *ast_struct_type = types[1]->IsPointerType() ? types[1]->As<ast::PointerType>()->GetPointeeType()->As<ast::StructType>() : types[1]->As<ast::StructType>();
+
+          // Compute the index of the requested field within the structure
+          auto elem_index = dl.getStructLayout(struct_type)->getElementContainingOffset(offset);
+          NOISEPAGE_ASSERT(elem_index == ast_struct_type->GetFieldContainingOffset(offset), "Structure element calculations divergent");
+
+          // Compute a pointer to the field identified above
+          auto *addr = ir_builder->CreateStructGEP(args[1], elem_index);
+
+          // Determine if their is a type mismatch between source and destination
+          if (addr->getType() != args[0]->getType()->getPointerElementType()) {
+            std::cout << "Type Mismatch" << std::endl;
+            // Attempt to resolve nested structure
+
+            // Compute the offset of the inner structure within outer structure (if present)
+            auto offset_within_outer = dl.getStructLayout(struct_type)->getElementOffset(elem_index);
+            NOISEPAGE_ASSERT(offset_within_outer == ast_struct_type->GetOffsetOfFieldByIndex(elem_index), "Structure element offsets divergent");
+
+            // While the member of the structure at the requested offset is also a structure...
+            ast::Type* inner_type = ast_struct_type->LookupFieldByIndex(elem_index);
+            while (inner_type->IsStructType()) {
+              NOISEPAGE_ASSERT(struct_type->getElementType(elem_index)->isStructTy(), "LLVM <-> AST type mismatch");
+              std::cout << "NESTED STRUCTURE" << std::endl;
+              
+              // Get the LLVM type corresponding to the nested structure
+              struct_type = llvm::dyn_cast<llvm::StructType>(struct_type->getElementType(elem_index));
+              // Subtract the offset of the inner structure within the outer structure from total offset
+              offset -= offset_within_outer;
+              // Compute the new index of the desired element within the inner structure
+              elem_index = dl.getStructLayout(struct_type)->getElementContainingOffset(offset);
+              // Compute a pointer to this element
+              addr = ir_builder->CreateStructGEP(addr, elem_index);
+              
+              // Compute the updated offset 
+              offset_within_outer = dl.getStructLayout(struct_type)->getElementOffset(elem_index);
+              // Update the AST inner type for the next check
+              inner_type = inner_type->As<ast::StructType>()->LookupFieldByIndex(elem_index);
+            }
+          }
+          
+          // Finally, emit the store with the final address
           ir_builder->CreateStore(addr, args[0]);
+
         } else {
           llvm::SmallVector<llvm::Value *, 2> gep_args;
           uint32_t elem_size = dl.getTypeSizeInBits(pointee_type);
@@ -930,6 +1014,7 @@ void LLVMEngine::CompiledModuleBuilder::DefineFunction(const FunctionInfo &func_
 void LLVMEngine::CompiledModuleBuilder::DefineFunctions() {
   llvm::IRBuilder<> ir_builder(*context_);
   for (const auto &func_info : tpl_module_.GetFunctionsInfo()) {
+    std::cout << "Defining Function: " << func_info.GetName() << std::endl;
     DefineFunction(func_info, &ir_builder);
   }
 }

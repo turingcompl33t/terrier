@@ -675,6 +675,15 @@ class StructType : public Type {
   }
 
   /**
+   * Stuff.
+   */
+  Type* LookupFieldByIndex(uint32_t index) const {
+    NOISEPAGE_ASSERT(index < unpadded_fields_.size(), "Index out of range");
+    // Lookup on unpadded fields to ignore additional padding(?)
+    return unpadded_fields_[index].type_;
+  }
+
+  /**
    * @param name field of to lookup
    * @return The offset of the field in the structure with name @em name. This accounts for all
    *         required padding by all structur members on the machine. If no field exists with the
@@ -687,6 +696,40 @@ class StructType : public Type {
       }
     }
     return 0;
+  }
+
+  /**
+   * Hey.
+   */
+  uint32_t GetOffsetOfFieldByIndex(uint32_t index) const {
+    NOISEPAGE_ASSERT(index < fields_.size(), "Index of out range");
+    return field_offsets_[index];
+  }
+
+  /**
+   * More things.
+   */
+  uint32_t GetFieldContainingOffset(uint32_t query) const {
+    NOISEPAGE_ASSERT(fields_.size() == field_offsets_.size(), "Logic Error");
+    const auto final_offset = field_offsets_.back();
+    if (query >= final_offset) {
+      const auto final_size = fields_.back().type_->GetSize();
+      if (query < final_offset + final_size) {
+        return static_cast<uint32_t>(fields_.size() - 1);
+      }
+      throw std::runtime_error{"invalid offset"};
+    }
+
+    // field_offsets_ corresponds to fields_, which includes padding fields
+    for (auto i = 0UL; i < fields_.size() - 1; ++i) {
+      const auto beg = field_offsets_[i];
+      const auto end = field_offsets_[i + 1];
+      if (query >= beg && query < end) {
+        return static_cast<uint32_t>(i);
+      }
+    }
+
+    throw std::runtime_error{"invalid offset (?)"};
   }
 
   /**
