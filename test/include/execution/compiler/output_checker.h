@@ -32,13 +32,21 @@ class MultiChecker : public OutputChecker {
    * Constructor
    * @param checkers list of output checkers
    */
-  explicit MultiChecker(std::vector<OutputChecker *> &&checkers) : checkers_{std::move(checkers)} {}
+  // explicit MultiChecker(std::vector<std::unique_ptr<OutputChecker>> &&checkers) : checkers_{std::move(checkers)} {}
+  MultiChecker() = default;
+
+  /**
+   * 
+   */
+  void Emplace(std::unique_ptr<OutputChecker> &&checker) {
+    checkers_.push_back(std::move(checker));
+  }
 
   /**
    * Call checkCorrectness on all output checkers
    */
   void CheckCorrectness() override {
-    for (const auto checker : checkers_) {
+    for (const auto &checker : checkers_) {
       checker->CheckCorrectness();
     }
   }
@@ -48,21 +56,24 @@ class MultiChecker : public OutputChecker {
    * @param output current output batch
    */
   void ProcessBatch(const std::vector<std::vector<sql::Val *>> &output) override {
-    for (const auto checker : checkers_) {
+    for (const auto &checker : checkers_) {
       checker->ProcessBatch(output);
     }
   }
 
  private:
-  // list of checkers
-  std::vector<OutputChecker *> checkers_;
+  /**
+   * The collection of output checkers.
+   * The MultiChecker instance owns its subordinate checkers.
+   */
+  std::vector<std::unique_ptr<OutputChecker>> checkers_;
 };
 
 using RowChecker = std::function<void(const std::vector<sql::Val *> &)>;
 using CorrectnessFn = std::function<void()>;
 class GenericChecker : public OutputChecker {
  public:
-  GenericChecker(RowChecker row_checker, CorrectnessFn correctness_fn)
+  GenericChecker(RowChecker &&row_checker, CorrectnessFn &&correctness_fn)
       : row_checker_{std::move(row_checker)}, correctness_fn_(std::move(correctness_fn)) {}
 
   void CheckCorrectness() override {
@@ -282,6 +293,11 @@ class MultiOutputCallback {
 class OutputStore {
  public:
   /**
+   * 
+   */
+  OutputStore() = default;
+
+  /**
    * Constructor
    * @param checker checker to run
    * @param schema output schema of the query.
@@ -290,9 +306,21 @@ class OutputStore {
       : schema_(schema), checker_(checker) {}
 
   /**
+   * 
+   */
+  void Inject(OutputChecker *checker, const noisepage::planner::OutputSchema *schema) {
+    NOISEPAGE_ASSERT(checker_ == nullptr, "OutputChecker::Inject() should only be called on deafult-constructed instance.");
+    NOISEPAGE_ASSERT(schema_ == nullptr, "OutputChecker::Inject() should only be called on default-constructed instace.");
+    checker_ = checker;
+    schema_ = schema;
+  }
+
+  /**
    * OutputCallback function. This will gather the output in a vector.
    */
   void operator()(byte *tuples, uint32_t num_tuples, uint32_t tuple_size) {
+    NOISEPAGE_ASSERT(checker_ != nullptr, "Must call OutputChecker::Inject() on default-constructed instance prior to use.");
+    NOISEPAGE_ASSERT(schema_ != nullptr, "Must call OutputChecker::Inject() on default constructed instance prior to use.");
     for (uint32_t row = 0; row < num_tuples; row++) {
       uint32_t curr_offset = 0;
       std::vector<sql::Val *> vals;
@@ -345,6 +373,14 @@ class OutputStore {
     }
     checker_->ProcessBatch(output_);
     output_.clear();
+  }
+
+  /**
+   * Get the output callback for the OutputStore. We need to return a freshly-constructed
+   * @return A thing.
+   */
+  exec::OutputCallback ConstructOutputCallback() {
+    return [this](byte *tuples, uint32_t num_tuples, uint32_t tuple_size) { operator()(tuples, num_tuples, tuple_size); };
   }
 
  private:

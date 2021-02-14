@@ -936,7 +936,7 @@ file(GLOB_RECURSE NOISEPAGE_TEST_SOURCES
         )
 
 # The individual tests that require bytecode_handlers_ir.bc present in the test directory.
-set(TESTS_REQUIRING_BITCODE atomics_test)
+set(TESTS_REQUIRING_BITCODE atomics_test compiler_test)
 
 foreach (NOISEPAGE_TEST_CPP ${NOISEPAGE_TEST_SOURCES})
     file(RELATIVE_PATH NOISEPAGE_TEST_CPP_REL "${PROJECT_SOURCE_DIR}/test" ${NOISEPAGE_TEST_CPP})

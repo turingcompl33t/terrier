@@ -75,6 +75,20 @@ class SqlBasedTest : public TplTest {
     return catalog_->GetAccessor(common::ManagedPointer(test_txn_), test_db_oid_, DISABLED);
   }
 
+  /**
+   * 
+   */
+  catalog::CatalogAccessor *GetDefaultAccessor() const {
+    return accessor_.get();
+  }
+
+  /**
+   * 
+   */
+  const exec::ExecutionSettings &GetDefaultExecutionSettings() const {
+    return *exec_settings_;
+  }
+
  protected:
   std::unique_ptr<catalog::CatalogAccessor> accessor_;
   transaction::TransactionContext *test_txn_;

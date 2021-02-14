@@ -14,6 +14,7 @@ namespace noisepage::runner {
 class MiniRunners;
 }  // namespace noisepage::runner
 
+// TODO(Kyle): remove all of these forward declarations
 namespace noisepage::execution::compiler::test {
 class CompilerTest_SimpleSeqScanTest_Test;
 class CompilerTest_SimpleSeqScanNonVecFilterTest_Test;
@@ -352,6 +353,7 @@ class EXPORT ExecOUFeatureVector {
  */
 class PipelineOperatingUnits {
  public:
+  // TODO(Kyle): remove all of these friend declarations
   friend class noisepage::optimizer::IdxJoinTest_SimpleIdxJoinTest_Test;
   friend class noisepage::execution::compiler::test::CompilerTest_SimpleSeqScanTest_Test;
   friend class noisepage::execution::compiler::test::CompilerTest_SimpleSeqScanNonVecFilterTest_Test;
@@ -412,6 +414,13 @@ class PipelineOperatingUnits {
    * @return if exist or not
    */
   bool HasPipelineFeatures(execution::pipeline_id_t pipeline) const { return units_.find(pipeline) != units_.end(); }
+
+  /**
+   * @return An immutable reference to the pipeline units map.
+   */
+  const std::unordered_map<execution::pipeline_id_t, ExecutionOperatingUnitFeatureVector> &GetUnits() const noexcept {
+    return units_;
+  }
 
  private:
   std::unordered_map<execution::pipeline_id_t, ExecutionOperatingUnitFeatureVector> units_{};

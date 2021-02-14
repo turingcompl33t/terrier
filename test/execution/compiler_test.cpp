@@ -1,5 +1,6 @@
 #include "execution/compiler/compiler.h"
 
+#include <array>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -7,9 +8,13 @@
 #include <utility>
 #include <vector>
 
+// TODO(Kyle): remove
+#include <iostream>
+
 #include "catalog/catalog_defs.h"
 #include "execution/ast/ast_dump.h"
 #include "execution/ast/context.h"
+#include "execution/compiled_tpl_test.h"
 #include "execution/compiler/compilation_context.h"
 #include "execution/compiler/executable_query.h"
 #include "execution/compiler/expression_maker.h"
@@ -44,6 +49,22 @@
 namespace noisepage::execution::compiler::test {
 class CompilerTest : public SqlBasedTest {
  public:
+  /**
+   * Perform test-suite level initialization.
+   */
+  static void SetUpTestSuite() {
+    // Initialize the LLVM engine for compiled execution
+    CompiledTplTest::SetUpTestSuite();
+  }
+
+  /**
+   * Perform test-suite level teardown.
+   */
+  static void TearDownTestSuite() {
+    // Shutdown the LLVM engine
+    CompiledTplTest::TearDownTestSuite();
+  }
+
   void SetUp() override {
     SqlBasedTest::SetUp();
     // Make the test tables
@@ -67,8 +88,39 @@ class CompilerTest : public SqlBasedTest {
     return set_a == set_b;
   }
 
+  /**
+   * The execution modes in which all individual tests will be run.
+   */
+  static constexpr std::array<vm::ExecutionMode, 2> EXECUTION_MODES{vm::ExecutionMode::Interpret,
+                                                                    vm::ExecutionMode::Compiled};
+  // TODO(Kyle): remove
   static constexpr vm::ExecutionMode MODE = vm::ExecutionMode::Interpret;
 };
+
+/**
+ * TODO(Kyle): rename this LOL
+ */
+using ExecutionSubstrate = std::tuple<std::unique_ptr<exec::ExecutionContext>, std::unique_ptr<OutputChecker>, std::unique_ptr<exec::OutputCallback>>;
+
+/**
+ * Execute the provided query in all execution modes, validating results against 
+ * the output checker produced by the provided `maker` callback function.
+ * @param query The executable query to run
+ * @param maker The callback function that is invoked to construct the execution substrate for the query
+ */
+static void ExecuteAndCheckInAllModes(execution::compiler::ExecutableQuery *query, std::function<ExecutionSubstrate(OutputStore*)> maker) {
+  for (const auto &exec_mode : CompilerTest::EXECUTION_MODES) {
+    // Make the substrate in which the query executes
+    OutputStore store{};
+    auto [exec_ctx, checker, callback] = maker(&store);
+    
+    // Run the query in the desired execution mode
+    query->Run(common::ManagedPointer(exec_ctx), exec_mode);
+    
+    // Check the correctness of the query results
+    checker->CheckCorrectness();
+  }
+}
 
 // NOLINTNEXTLINE
 TEST_F(CompilerTest, CompileFromSource) {
@@ -79,20 +131,22 @@ TEST_F(CompilerTest, CompileFromSource) {
   // Should be able to compile multiple TPL programs from source, including
   // functions that potentially collide in name.
 
-  for (uint32_t i = 1; i < 4; i++) {
-    auto src = std::string("fun test() -> int32 { return " + std::to_string(i * 10) + " }");
-    auto input = Compiler::Input("Simple Test", &context, &src);
-    auto module = Compiler::RunCompilationSimple(input);
+  for (const auto &exec_mode : EXECUTION_MODES) {
+    for (uint32_t i = 1; i < 4; i++) {
+      auto src = std::string("fun test() -> int32 { return " + std::to_string(i * 10) + " }");
+      auto input = Compiler::Input("Simple Test", &context, &src);
+      auto module = Compiler::RunCompilationSimple(input);
 
-    // The module should be valid since the input source is valid
-    EXPECT_FALSE(module == nullptr);
+      // The module should be valid since the input source is valid
+      EXPECT_FALSE(module == nullptr);
 
-    // The function should exist
-    std::function<int64_t()> test_fn;
-    EXPECT_TRUE(module->GetFunction("test", vm::ExecutionMode::Interpret, &test_fn));
+      // The function should exist
+      std::function<int64_t()> test_fn;
+      EXPECT_TRUE(module->GetFunction("test", exec_mode, &test_fn));
 
-    // And should return what we expect
-    EXPECT_EQ(i * 10, test_fn());
+      // And should return what we expect
+      EXPECT_EQ(i * 10, test_fn());
+    }
   }
 }
 
@@ -133,6 +187,71 @@ TEST_F(CompilerTest, CompileToAst) {
 }
 
 // NOLINTNEXTLINE
+TEST_F(CompilerTest, DeadSimpleSeqScanTest) {
+  // SELECT colA, colB FROM test_1 WHERE colA < 500;
+  auto accessor = MakeAccessor();
+  auto table_oid = accessor->GetTableOid(NSOid(), "test_1");
+  auto table_schema = accessor->GetSchema(table_oid);
+  ExpressionMaker expr_maker;
+  std::unique_ptr<planner::AbstractPlanNode> seq_scan;
+  OutputSchemaHelper seq_scan_out{0, &expr_maker};
+  {
+    // OIDs
+    auto cola_oid = table_schema.GetColumn("colA").Oid();
+    auto colb_oid = table_schema.GetColumn("colB").Oid();
+
+    // Get Table columns
+    auto col1 = expr_maker.CVE(cola_oid, type::TypeId::INTEGER);
+    auto col2 = expr_maker.CVE(colb_oid, type::TypeId::INTEGER);
+
+    seq_scan_out.AddOutput("col1", common::ManagedPointer(col1));
+    seq_scan_out.AddOutput("col2", common::ManagedPointer(col2));
+    auto schema = seq_scan_out.MakeSchema();
+
+    // Make predicate
+    auto predicate = expr_maker.ComparisonLt(col1, expr_maker.Constant(500));
+
+    // Build
+    planner::SeqScanPlanNode::Builder builder{};
+    seq_scan = builder.SetOutputSchema(std::move(schema))
+                   .SetColumnOids({cola_oid, colb_oid})
+                   .SetScanPredicate(predicate)
+                   .SetIsForUpdateFlag(false)
+                   .SetTableOid(table_oid)
+                   .Build();
+  }
+
+  auto maker = [this, seq_scan = seq_scan.get()](OutputStore *store){
+    // Make the output checker
+    auto checker = std::make_unique<SingleIntComparisonChecker>(std::less<>(), 0, 500);
+    store->Inject(checker.get(), seq_scan->GetOutputSchema().Get());
+
+    // Construct the output callback; must survive beyond scope because the execution context does not take ownership
+    auto callback = std::make_unique<exec::OutputCallback>(store->ConstructOutputCallback());
+    
+    // Create the execution context
+    auto exec_ctx = MakeExecCtx(callback.get(), seq_scan->GetOutputSchema().Get());
+    return std::make_tuple(std::move(exec_ctx), std::move(checker), std::move(callback));
+  };
+
+  // Run & Check
+  auto executable = execution::compiler::CompilationContext::Compile(*seq_scan, GetDefaultExecutionSettings(),
+                                                                     GetDefaultAccessor());
+  ExecuteAndCheckInAllModes(executable.get(), maker);
+
+  // Pipeline Units
+  auto pipeline = executable->GetPipelineOperatingUnits();
+  EXPECT_EQ(pipeline->GetUnits().size(), 1);
+
+  auto feature_vec = pipeline->GetPipelineFeatures(execution::pipeline_id_t(1));
+  auto exp_vec = std::vector<selfdriving::ExecutionOperatingUnitType>{
+      selfdriving::ExecutionOperatingUnitType::SEQ_SCAN, selfdriving::ExecutionOperatingUnitType::OP_INTEGER_COMPARE,
+      selfdriving::ExecutionOperatingUnitType::OUTPUT};
+
+  EXPECT_TRUE(CheckFeatureVectorEquality(feature_vec, exp_vec));
+}
+
+// NOLINTNEXTLINE
 TEST_F(CompilerTest, SimpleSeqScanTest) {
   // SELECT col1, col2, col1 * col2, col1 >= 100*col2 FROM test_1 WHERE col1 < 500 AND col2 >= 3;
   auto accessor = MakeAccessor();
@@ -169,28 +288,30 @@ TEST_F(CompilerTest, SimpleSeqScanTest) {
                    .SetTableOid(table_oid)
                    .Build();
   }
-  // Make the output checkers
-  SingleIntComparisonChecker col1_checker(std::less<>(), 0, 500);
-  SingleIntComparisonChecker col2_checker(std::greater_equal<>(), 1, 3);
 
-  MultiChecker multi_checker{std::vector<OutputChecker *>{&col1_checker, &col2_checker}};
+  auto maker = [this, seq_scan = seq_scan.get()](OutputStore *store){
+    // Make the output checker
+    auto checker = std::make_unique<MultiChecker>();
+    checker->Emplace(std::make_unique<SingleIntComparisonChecker>(std::less<>(), 0, 500));
+    checker->Emplace(std::make_unique<SingleIntComparisonChecker>(std::greater_equal<>(), 1, 3));
+    store->Inject(checker.get(), seq_scan->GetOutputSchema().Get());
 
-  // Create the execution context
-  OutputStore store{&multi_checker, seq_scan->GetOutputSchema().Get()};
-  exec::OutputPrinter printer(seq_scan->GetOutputSchema().Get());
-  MultiOutputCallback callback{std::vector<exec::OutputCallback>{store, printer}};
-  exec::OutputCallback callback_fn = callback.ConstructOutputCallback();
-  auto exec_ctx = MakeExecCtx(&callback_fn, seq_scan->GetOutputSchema().Get());
+    // Construct the output callback
+    auto callback = std::make_unique<exec::OutputCallback>(store->ConstructOutputCallback());
+
+    // Create the execution context
+    auto exec_ctx = MakeExecCtx(callback.get(), seq_scan->GetOutputSchema().Get());
+    return std::make_tuple(std::move(exec_ctx), std::move(checker), std::move(callback));
+  };
 
   // Run & Check
-  auto executable = execution::compiler::CompilationContext::Compile(*seq_scan, exec_ctx->GetExecutionSettings(),
-                                                                     exec_ctx->GetAccessor());
-  executable->Run(common::ManagedPointer(exec_ctx), MODE);
-  multi_checker.CheckCorrectness();
+  auto executable = execution::compiler::CompilationContext::Compile(*seq_scan, GetDefaultExecutionSettings(),
+                                                                     GetDefaultAccessor());
+  ExecuteAndCheckInAllModes(executable.get(), maker);
 
   // Pipeline Units
   auto pipeline = executable->GetPipelineOperatingUnits();
-  EXPECT_EQ(pipeline->units_.size(), 1);
+  EXPECT_EQ(pipeline->GetUnits().size(), 1);
 
   auto feature_vec = pipeline->GetPipelineFeatures(execution::pipeline_id_t(1));
   auto exp_vec = std::vector<selfdriving::ExecutionOperatingUnitType>{
@@ -246,36 +367,40 @@ TEST_F(CompilerTest, SimpleSeqScanNonVecFilterTest) {
                    .SetTableOid(table_oid)
                    .Build();
   }
-  // Make the output checkers
-  std::function<void(const std::vector<sql::Val *> &)> row_checker = [](const std::vector<sql::Val *> &vals) {
-    // Read cols
-    auto col1 = static_cast<const sql::Integer *>(vals[0]);
-    auto col2 = static_cast<const sql::Integer *>(vals[1]);
-    ASSERT_FALSE(col1->is_null_ || col2->is_null_);
-    // Check predicate
-    ASSERT_TRUE((col1->val_ < 500 && col2->val_ >= 5) ||
-                (col1->val_ >= 500 && col1->val_ < 1000 && (col2->val_ == 7 || col2->val_ == 3)));
+
+  auto maker = [this, seq_scan = seq_scan.get()](OutputStore *store){
+    // Make the output checkers
+    RowChecker row_checker = [](const std::vector<sql::Val *> &vals) {
+      // Read cols
+      auto col1 = static_cast<const sql::Integer *>(vals[0]);
+      auto col2 = static_cast<const sql::Integer *>(vals[1]);
+      ASSERT_FALSE(col1->is_null_ || col2->is_null_);
+      // Check predicate
+      ASSERT_TRUE((col1->val_ < 500 && col2->val_ >= 5) ||
+                  (col1->val_ >= 500 && col1->val_ < 1000 && (col2->val_ == 7 || col2->val_ == 3)));
+    };
+
+    // Construct the output checker
+    auto checker = std::make_unique<MultiChecker>();
+    checker->Emplace(std::make_unique<GenericChecker>(std::move(row_checker), CorrectnessFn{}));
+    store->Inject(checker.get(), seq_scan->GetOutputSchema().Get());
+
+    // Construct the output callback
+    auto callback = std::make_unique<exec::OutputCallback>(store->ConstructOutputCallback());
+
+    // Create the execution context
+    auto exec_ctx = MakeExecCtx(callback.get(), seq_scan->GetOutputSchema().Get());
+    return std::make_tuple(std::move(exec_ctx), std::move(checker), std::move(callback));
   };
-  GenericChecker checker(row_checker, {});
-
-  MultiChecker multi_checker{std::vector<OutputChecker *>{&checker}};
-
-  // Create the execution context
-  OutputStore store{&multi_checker, seq_scan->GetOutputSchema().Get()};
-  exec::OutputPrinter printer(seq_scan->GetOutputSchema().Get());
-  MultiOutputCallback callback{std::vector<exec::OutputCallback>{store, printer}};
-  exec::OutputCallback callback_fn = callback.ConstructOutputCallback();
-  auto exec_ctx = MakeExecCtx(&callback_fn, seq_scan->GetOutputSchema().Get());
 
   // Run & Check
-  auto executable = execution::compiler::CompilationContext::Compile(*seq_scan, exec_ctx->GetExecutionSettings(),
-                                                                     exec_ctx->GetAccessor());
-  executable->Run(common::ManagedPointer(exec_ctx), MODE);
-  multi_checker.CheckCorrectness();
+  auto executable = execution::compiler::CompilationContext::Compile(*seq_scan, GetDefaultExecutionSettings(),
+                                                                    GetDefaultAccessor());
+  ExecuteAndCheckInAllModes(executable.get(), maker);
 
   // Pipeline Units
   auto pipeline = executable->GetPipelineOperatingUnits();
-  EXPECT_EQ(pipeline->units_.size(), 1);
+  EXPECT_EQ(pipeline->GetUnits().size(), 1);
 
   auto feature_vec = pipeline->GetPipelineFeatures(execution::pipeline_id_t(1));
   auto exp_vec = std::vector<selfdriving::ExecutionOperatingUnitType>{
@@ -284,6 +409,8 @@ TEST_F(CompilerTest, SimpleSeqScanNonVecFilterTest) {
 
   EXPECT_TRUE(CheckFeatureVectorEquality(feature_vec, exp_vec));
 }
+
+/*
 
 // NOLINTNEXTLINE
 TEST_F(CompilerTest, SimpleSeqScanWithProjectionTest) {
@@ -3508,6 +3635,7 @@ TEST_F(CompilerTest, SimpleInsertWithParamsTest) {
     checker.CheckCorrectness();
   }
 }
+*/
 
 /*
 // NOLINTNEXTLINE
